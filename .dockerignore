@@ -1,0 +1,27 @@
+# Build artefacts and deps — the image installs and builds its own.
+node_modules
+.next
+out
+
+# Secrets. Railway (or any host) supplies these as environment variables;
+# baking them into an image layer would leak them to anyone who can pull it.
+.env
+.env.*
+!.env.example
+
+# VCS and tooling
+.git
+.gitignore
+*.log
+npm-debug.log*
+
+# Editor / OS noise
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# Project docs and agent instructions — not needed at runtime.
+README.md
+AGENTS.md
+CLAUDE.md
