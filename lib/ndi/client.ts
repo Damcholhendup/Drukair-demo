@@ -19,6 +19,18 @@ export type IssueCredentialResult = {
 const REQUEST_TIMEOUT_MS = 15_000;
 
 /**
+ * Issuance gets more patience than everything else, specifically because it's
+ * the one call that's never retried (see issueCredential below). Observed
+ * directly: a real issuance can take longer than 15s to respond even though
+ * NDI fully completes it server-side — with the default timeout that reads as
+ * a "failed" issuance in our own state despite a credential actually landing
+ * in the holder's wallet. Widening the window here reduces that false
+ * negative without touching the "never retry" safety property — it's still
+ * exactly one attempt, just one willing to wait longer before giving up.
+ */
+const ISSUANCE_TIMEOUT_MS = 40_000;
+
+/**
  * NDI staging drops pooled keep-alive connections, which surfaces as a hung
  * request or "connection closed" rather than an HTTP error. Observed directly:
  * three identical calls gave 60s hang / 588ms success / 60s hang.
@@ -31,6 +43,7 @@ async function fetchWithRetry(
   url: string,
   init: RequestInit,
   attempts = 3,
+  timeoutMs = REQUEST_TIMEOUT_MS,
 ): Promise<Response> {
   let lastError: unknown;
 
@@ -38,7 +51,7 @@ async function fetchWithRetry(
     try {
       return await fetch(url, {
         ...init,
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal: AbortSignal.timeout(timeoutMs),
         cache: "no-store",
       });
     } catch (error) {
@@ -334,7 +347,8 @@ export async function issueCredential(params: {
         forRelationship: params.forRelationship ?? "",
       }),
     },
-    1,
+    1, // NOT retried — see the comment on issueCredential's doc block above
+    ISSUANCE_TIMEOUT_MS,
   );
 
   const text = await res.text();
