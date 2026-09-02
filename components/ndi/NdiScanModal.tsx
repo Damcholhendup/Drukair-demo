@@ -3,14 +3,21 @@
 import { motion } from "framer-motion";
 import Image from "next/image";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { assets, brand, copy } from "@/lib/ndi/config";
+import { assets, brand, copy, flowUiMode } from "@/lib/ndi/config";
 import QrCode, { type QrMatrix } from "./QrCode";
+
+/** Which stage/flow this modal instance is running. `walkin` is the walk-in
+ *  flow's single stage: proves CID, issues the boarding pass directly. */
+type Phase = "ticket" | "boarding" | "walkin";
 
 type ProofResponse = {
   threadId: string;
-  proofRequestURL: string;
-  deepLinkURL: string;
-  qr: QrMatrix;
+  /** "push" means NDI delivered the request directly to an existing
+   *  relationship — no QR to show, just a wait for in-wallet approval. */
+  mode: "qr" | "push";
+  proofRequestURL?: string;
+  deepLinkURL?: string;
+  qr: QrMatrix | null;
   subscribed: boolean;
 };
 
@@ -39,11 +46,14 @@ type Outcome =
   | { status: "consumed"; issuance: IssuanceInfo | null }
   | { status: "declined" }
   | { status: "not_registered" }
+  | { status: "not_ticketed" }
   | { status: "failed"; reason?: string }
   | { status: "expired" }
   | { status: "unknown" };
 
 const POLL_INTERVAL_MS = 2000;
+/** How long the "issued" state sits on screen before the dialog closes itself. */
+const AUTO_CLOSE_MS = 2500;
 
 /** Stand-in for the NDI app's green scan icon until the real asset arrives. */
 function ScanGlyph() {
@@ -104,13 +114,27 @@ function PhoneGlyph() {
 }
 
 /** Progress/result of the follow-on issuance, shown beneath the proof result. */
-function IssuanceStatusLine({ issuance }: { issuance: IssuanceInfo | null }) {
+function IssuanceStatusLine({
+  issuance,
+  phase,
+  autoClosing,
+}: {
+  issuance: IssuanceInfo | null;
+  phase: Phase;
+  /** True when this "issued" state is final for this modal (see the
+   *  auto-close effect below) — shows a closing hint rather than leaving the
+   *  dialog looking finished-but-idle. False mid-transition (continuous mode
+   *  advancing from ticket into boarding), where nothing closes yet. */
+  autoClosing: boolean;
+}) {
   if (!issuance) return null;
+
+  const isBoardingPass = phase !== "ticket"; // "boarding" and "walkin" both issue it
 
   if (issuance.status === "issuing") {
     return (
       <p className="mt-4 text-sm" style={{ color: brand.muted }}>
-        Issuing your credential…
+        {isBoardingPass ? "Issuing your boarding pass…" : "Issuing your ticket…"}
       </p>
     );
   }
@@ -119,10 +143,10 @@ function IssuanceStatusLine({ issuance }: { issuance: IssuanceInfo | null }) {
     return (
       <div className="mt-4">
         <p className="text-sm font-semibold" style={{ color: brand.green }}>
-          Credential sent to your wallet
+          {isBoardingPass ? "Boarding pass sent to your wallet" : "Ticket sent to your wallet"}
         </p>
         {/* Only present when NDI had to open a fresh relationship — when the
-            existing one from check-in was reused, nothing further to scan. */}
+            existing one was reused, nothing further to scan. */}
         {issuance.deepLinkURL && (
           <a
             href={issuance.deepLinkURL}
@@ -131,6 +155,11 @@ function IssuanceStatusLine({ issuance }: { issuance: IssuanceInfo | null }) {
           >
             Open Bhutan NDI wallet
           </a>
+        )}
+        {autoClosing && (
+          <p className="mt-3 text-xs" style={{ color: brand.muted }}>
+            Closing automatically…
+          </p>
         )}
       </div>
     );
@@ -142,9 +171,13 @@ function IssuanceStatusLine({ issuance }: { issuance: IssuanceInfo | null }) {
 /** Replaces the QR once the check-in reaches a terminal state. */
 function OutcomePanel({
   outcome,
+  phase,
+  autoClosing,
   onRetry,
 }: {
   outcome: Exclude<Outcome, { status: "pending" }>;
+  phase: Phase;
+  autoClosing: boolean;
   onRetry: () => void;
 }) {
   if (outcome.status === "verified") {
@@ -174,7 +207,7 @@ function OutcomePanel({
             </div>
           ))}
         </dl>
-        <IssuanceStatusLine issuance={outcome.issuance} />
+        <IssuanceStatusLine issuance={outcome.issuance} phase={phase} autoClosing={autoClosing} />
       </div>
     );
   }
@@ -185,10 +218,10 @@ function OutcomePanel({
     return (
       <div className="px-5">
         {outcome.issuance ? (
-          <IssuanceStatusLine issuance={outcome.issuance} />
+          <IssuanceStatusLine issuance={outcome.issuance} phase={phase} autoClosing={autoClosing} />
         ) : (
           <p className="text-sm" style={{ color: brand.muted }}>
-            This check-in was already completed.
+            This step was already completed.
           </p>
         )}
       </div>
@@ -200,11 +233,13 @@ function OutcomePanel({
       ? "You declined the request in your wallet."
       : outcome.status === "not_registered"
         ? "This ID number isn't recognized."
-        : outcome.status === "expired"
-          ? "This code expired. Generate a new one."
-          : outcome.status === "unknown"
-            ? "This check-in is no longer available."
-            : (outcome.reason ?? "Check-in could not be completed.");
+        : outcome.status === "not_ticketed"
+          ? "No ticket was found for that ticket number, or it hasn't been issued yet — complete check-in first."
+          : outcome.status === "expired"
+            ? "This code expired. Generate a new one."
+            : outcome.status === "unknown"
+              ? "This step is no longer available."
+              : (outcome.reason ?? "This step could not be completed.");
 
   return (
     <div className="px-5">
@@ -234,8 +269,32 @@ function OutcomePanel({
  * Mounted only while open — the parent wraps it in <AnimatePresence> — so it
  * starts in `loading` and needs no state reset on reopen. Each mount creates a
  * fresh proof request, because thread IDs are single-use.
+ *
+ * Runs one of two stages (`kind`): `ticket` (proof of CID, issues the ticket
+ * VC) or `boarding` (proof of ticket number — CID again for now — issues the
+ * boarding pass VC, gated server-side on the ticket already existing). When
+ * `NEXT_PUBLIC_NDI_FLOW_UI_MODE=continuous`, a `ticket` modal that finishes
+ * issuing automatically advances in place into the `boarding` stage rather
+ * than closing — see the `phase` state below.
  */
-export default function NdiScanModal({ onClose }: { onClose: () => void }) {
+export default function NdiScanModal({
+  kind,
+  linkedRelationshipDid = null,
+  onClose,
+  onTicketIssued,
+}: {
+  kind: Phase;
+  /** Relationship captured at the ticket step, if any — passed along so the
+   *  server can (when configured) push the boarding request directly instead
+   *  of showing a fresh QR. Ignored when `kind` is "ticket". */
+  linkedRelationshipDid?: string | null;
+  onClose: () => void;
+  /** Fired once the ticket stage issues successfully, so the caller can
+   *  unlock the boarding stage (and, in "separate" UI mode, pass this along
+   *  the next time a `boarding` modal is opened). Never fired for `kind === "boarding"`. */
+  onTicketIssued?: (info: { relationshipDid: string | null }) => void;
+}) {
+  const [phase, setPhase] = useState<Phase>(kind);
   const [state, setState] = useState<State>({ status: "loading" });
   const [outcome, setOutcome] = useState<Outcome>({ status: "pending" });
   /** Held separately because the server only ever hands these over once. */
@@ -245,33 +304,52 @@ export default function NdiScanModal({ onClose }: { onClose: () => void }) {
     relationshipDid: string | null;
   }>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  /** The relationship to target for the CURRENT phase's request, if any. */
+  const targetRelationshipRef = useRef<string | null>(
+    kind === "boarding" ? linkedRelationshipDid : null,
+  );
+  const advancedToBoarding = useRef(false);
 
-  const fetchProofRequest = useCallback(async (signal?: AbortSignal) => {
-    try {
-      const res = await fetch("/api/ndi/proof-request", { method: "POST", signal });
-      const body = await res.json();
-      if (!res.ok) throw new Error(body?.error ?? `Request failed (${res.status})`);
-      return { status: "ready", data: body as ProofResponse } satisfies State;
-    } catch (e) {
-      if (e instanceof DOMException && e.name === "AbortError") return null;
-      return {
-        status: "error",
-        message: e instanceof Error ? e.message : "Could not reach Bhutan NDI",
-      } satisfies State;
-    }
-  }, []);
+  const fetchProofRequest = useCallback(
+    async (forPhase: Phase, signal?: AbortSignal) => {
+      try {
+        const res = await fetch("/api/ndi/proof-request", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            kind: forPhase,
+            relationshipDid:
+              forPhase === "boarding" ? (targetRelationshipRef.current ?? undefined) : undefined,
+          }),
+          signal,
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body?.error ?? `Request failed (${res.status})`);
+        return { status: "ready", data: body as ProofResponse } satisfies State;
+      } catch (e) {
+        if (e instanceof DOMException && e.name === "AbortError") return null;
+        return {
+          status: "error",
+          message: e instanceof Error ? e.message : "Could not reach Bhutan NDI",
+        } satisfies State;
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     const controller = new AbortController();
     let live = true;
-    void fetchProofRequest(controller.signal).then((next) => {
+    void fetchProofRequest(phase, controller.signal).then((next) => {
       if (live && next) setState(next);
     });
     return () => {
       live = false;
       controller.abort();
     };
-  }, [fetchProofRequest]);
+    // Only re-runs when `phase` itself changes (continuous mode's auto-advance).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -321,6 +399,30 @@ export default function NdiScanModal({ onClose }: { onClose: () => void }) {
           });
         }
         setOutcome(body);
+
+        // Ticket issued in "continuous" mode: advance in place to boarding
+        // instead of leaving the popup on the ticket's success state.
+        if (
+          phase === "ticket" &&
+          !advancedToBoarding.current &&
+          flowUiMode() === "continuous" &&
+          (body.status === "verified" || body.status === "consumed") &&
+          body.issuance?.status === "issued"
+        ) {
+          advancedToBoarding.current = true;
+          const relationshipDid =
+            (body.status === "verified" ? body.relationshipDid : null) ??
+            verified?.relationshipDid ??
+            null;
+          onTicketIssued?.({ relationshipDid });
+          targetRelationshipRef.current = relationshipDid;
+          setVerified(null);
+          setOutcome({ status: "pending" });
+          setState({ status: "loading" });
+          setPhase("boarding");
+          return;
+        }
+
         // Keep polling while pending, and also while the proof itself resolved
         // but issuance is still running — issuance is a second, slower call
         // that finishes well after the proof result does.
@@ -341,16 +443,57 @@ export default function NdiScanModal({ onClose }: { onClose: () => void }) {
       live = false;
       clearTimeout(timer);
     };
-  }, [canPoll, threadId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canPoll, threadId, phase]);
 
   const retry = () => {
     setState({ status: "loading" });
     setOutcome({ status: "pending" });
     setVerified(null);
-    void fetchProofRequest().then((next) => {
+    void fetchProofRequest(phase).then((next) => {
       if (next) setState(next);
     });
   };
+
+  // Once the ticket stage completed but this modal stays open only for its own
+  // stage (i.e. "separate" UI mode never reaches this branch, since phase never
+  // advances there) — kept simple: this fires once, in continuous mode only.
+  useEffect(() => {
+    if (
+      phase === "ticket" &&
+      kind === "ticket" &&
+      !advancedToBoarding.current &&
+      flowUiMode() !== "continuous"
+    ) {
+      // Separate mode: let the caller know as soon as issuance succeeds too,
+      // so a later "Boarding gate" step can unlock without waiting for close.
+      if (
+        (outcome.status === "verified" || outcome.status === "consumed") &&
+        outcome.issuance?.status === "issued"
+      ) {
+        const relationshipDid = verified?.relationshipDid ?? null;
+        onTicketIssued?.({ relationshipDid });
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [outcome]);
+
+  /**
+   * Once a stage's credential is actually issued, close on its own rather
+   * than leaving a "done" dialog sitting there waiting to be dismissed by
+   * hand — except mid-transition, where continuous mode is about to advance
+   * this same modal from ticket into boarding instead of closing it.
+   */
+  useEffect(() => {
+    const willAdvance = phase === "ticket" && flowUiMode() === "continuous";
+    const isDone =
+      (outcome.status === "verified" || outcome.status === "consumed") &&
+      outcome.issuance?.status === "issued";
+    if (!isDone || willAdvance) return;
+    const timer = setTimeout(onClose, AUTO_CLOSE_MS);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [outcome, phase]);
 
   /**
    * Once verified, keep showing the verified panel and let only the issuance
@@ -361,6 +504,12 @@ export default function NdiScanModal({ onClose }: { onClose: () => void }) {
     verified && (outcome.status === "verified" || outcome.status === "consumed")
       ? { status: "verified", ...verified, issuance: outcome.issuance ?? null }
       : outcome;
+
+  /** Mirrors the auto-close effect's condition, for the "Closing…" hint. */
+  const autoClosing = !(phase === "ticket" && flowUiMode() === "continuous");
+
+  const loadingLabel =
+    phase !== "ticket" ? "Requesting your boarding pass…" : "Generating QR code…";
 
   return (
     <motion.div
@@ -449,14 +598,16 @@ export default function NdiScanModal({ onClose }: { onClose: () => void }) {
             <span className="h-px flex-1 bg-black/15" />
           </div>
 
-          {/* 3 — QR code, in the spec's green rounded frame */}
+          {/* 3 — QR code, in the spec's green rounded frame (or, in "push"
+              mode, a wait state — no code to scan, the request already
+              reached the wallet directly) */}
           <div
             className="grid h-[264px] w-[264px] place-items-center rounded-2xl border-2 bg-white"
             style={{ borderColor: brand.green }}
           >
             {state.status === "loading" && (
               <span className="text-sm" style={{ color: brand.muted }}>
-                Generating QR code…
+                {loadingLabel}
               </span>
             )}
             {state.status === "error" && (
@@ -472,9 +623,26 @@ export default function NdiScanModal({ onClose }: { onClose: () => void }) {
                 </button>
               </div>
             )}
-            {data && shown.status === "pending" && <QrCode matrix={data.qr} px={232} />}
+            {data && shown.status === "pending" && data.mode === "qr" && data.qr && (
+              <QrCode matrix={data.qr} px={232} />
+            )}
+            {data && shown.status === "pending" && data.mode === "push" && (
+              <div className="px-6">
+                <p className="text-sm font-medium" style={{ color: brand.teal }}>
+                  Request sent to your Bhutan NDI wallet
+                </p>
+                <p className="mt-2 text-sm" style={{ color: brand.muted }}>
+                  Approve it there — no need to scan a code.
+                </p>
+              </div>
+            )}
             {data && shown.status !== "pending" && (
-              <OutcomePanel outcome={shown} onRetry={retry} />
+              <OutcomePanel
+                outcome={shown}
+                phase={phase}
+                autoClosing={autoClosing}
+                onRetry={retry}
+              />
             )}
           </div>
 
@@ -612,7 +780,7 @@ export default function NdiScanModal({ onClose }: { onClose: () => void }) {
             className="mt-[30px] font-mono text-[10px] tracking-wider break-all"
             style={{ color: brand.muted }}
           >
-            thid {data.threadId}
+            {phase} thid {data.threadId}
           </p>
         )}
       </motion.div>

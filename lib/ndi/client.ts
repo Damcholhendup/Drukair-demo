@@ -1,6 +1,6 @@
 import "server-only";
 
-import { proofRequest, server } from "./config";
+import { server } from "./config";
 
 export type IssueCredentialResult = {
   /** Use this for generating a QR — only present when a fresh scan is needed. */
@@ -174,10 +174,15 @@ export async function getAccessToken(): Promise<string> {
 export type ProofRequest = {
   proofRequestName: string;
   proofRequestThreadId: string;
-  /** Encode this as the QR code. */
-  proofRequestURL: string;
-  /** Use this for the "Open Bhutan NDI wallet" deep link. */
-  deepLinkURL: string;
+  /**
+   * Encode this as the QR code — absent when NDI pushed the request directly
+   * to an existing relationship instead of minting a fresh invitation (see
+   * `targetRelationshipDid` below).
+   */
+  proofRequestURL?: string;
+  /** Use this for the "Open Bhutan NDI wallet" deep link. Absent in the same
+   *  case as `proofRequestURL`. */
+  deepLinkURL?: string;
 };
 
 export class NdiError extends Error {
@@ -192,13 +197,30 @@ export class NdiError extends Error {
 }
 
 /**
- * Creates the check-in proof request: asks the holder to present "ID Number"
- * from their Foundational ID.
+ * Creates a proof request for either stage of the flow — which attributes are
+ * asked for comes entirely from `opts`, built from `ticketProofRequest` or
+ * `boardingProofRequest` in lib/ndi/config.ts.
  *
- * Attribute names are matched literally by NDI, so "ID Number" must keep its
- * space and capitalisation.
+ * Attribute names are matched literally by NDI, so e.g. "ID Number" must keep
+ * its space and capitalisation.
  */
-export async function createCheckInProofRequest(): Promise<ProofRequest> {
+export async function createProofRequest(opts: {
+  proofName: string;
+  purpose: string;
+  attributes: readonly { name: string; schemaUrl: () => string }[];
+  /**
+   * When set, asks NDI to deliver the proof request directly to this
+   * relationship instead of returning a fresh invitation to scan.
+   *
+   * See `boarding.noRescan` in config.ts for how this was confirmed live
+   * against staging: NDI genuinely validates this field (a bad value 400s,
+   * a well-formed-but-unknown UUID gets further, into a 500). This function
+   * still reports "push" mode purely from the response shape (no
+   * proofRequestURL), never from whether this was requested, so a real
+   * failure surfaces as an error rather than a silently wrong QR/push choice.
+   */
+  targetRelationshipDid?: string | null;
+}): Promise<ProofRequest> {
   const token = await getAccessToken();
 
   const res = await fetchWithRetry(`${server.clientBaseUrl}/verifier/v1/proof-request`, {
@@ -208,14 +230,17 @@ export async function createCheckInProofRequest(): Promise<ProofRequest> {
       Authorization: `Bearer ${token}`,
       accept: "*/*",
     },
-    // Built from lib/ndi/config.ts — change the requested attributes there.
     body: JSON.stringify({
-      proofName: proofRequest.proofName,
-      purpose: proofRequest.purpose,
-      proofAttributes: proofRequest.attributes.map((attr) => ({
+      proofName: opts.proofName,
+      purpose: opts.purpose,
+      proofAttributes: opts.attributes.map((attr) => ({
         name: attr.name,
         restrictions: [{ schema_name: attr.schemaUrl() }],
       })),
+      // Mirrors issueCredential's forRelationship — see the caveat above.
+      ...(opts.targetRelationshipDid
+        ? { forRelationship: opts.targetRelationshipDid }
+        : {}),
     }),
   });
 
@@ -236,19 +261,19 @@ export async function createCheckInProofRequest(): Promise<ProofRequest> {
   }
 
   const data = body.data;
-  if (!data?.proofRequestURL || !data.proofRequestThreadId) {
+  if (!data?.proofRequestThreadId) {
     throw new NdiError(
-      "NDI proof request response was missing proofRequestURL / threadId",
+      "NDI proof request response was missing proofRequestThreadId",
       502,
       JSON.stringify(body).slice(0, 500),
     );
   }
 
   return {
-    proofRequestName: data.proofRequestName ?? proofRequest.proofName,
+    proofRequestName: data.proofRequestName ?? opts.proofName,
     proofRequestThreadId: data.proofRequestThreadId,
-    proofRequestURL: data.proofRequestURL,
-    deepLinkURL: data.deepLinkURL ?? "",
+    proofRequestURL: data.proofRequestURL || undefined,
+    deepLinkURL: data.deepLinkURL || undefined,
   };
 }
 
@@ -265,6 +290,14 @@ export async function createCheckInProofRequest(): Promise<ProofRequest> {
  * QR. Left blank, NDI mints a fresh relationship and returns a new
  * `credInviteURL` / `deepLinkURL` for that instead.
  *
+ * Wire field is `forRelationship` (capital R) — confirmed against a real
+ * issuance payload for this schema. An earlier version of this code sent
+ * `forrelationship` (all lowercase), matching an earlier example. That may be
+ * the actual reason every prior issuance opened a fresh relationship even when
+ * a relationshipDid was passed: NDI likely ignored the misnamed field rather
+ * than erroring, which reads identically to "the relationship wasn't found".
+ *
+
  * NOT retried on transport failure (attempts = 1), unlike every other call
  * here. A timeout or dropped connection tells us nothing about whether NDI
  * already processed the request — so retrying risks issuing the credential
@@ -274,7 +307,10 @@ export async function createCheckInProofRequest(): Promise<ProofRequest> {
  * a duplicate one cannot be un-issued.
  */
 export async function issueCredential(params: {
-  credentialData: Record<string, string>;
+  /** Some schemas expect specific attributes as JSON numbers rather than
+   *  strings — see lib/ndi/records.ts's `toIssuancePayload`, which is what
+   *  should build this rather than passing raw string values through. */
+  credentialData: Record<string, string | number>;
   schemaId: string;
   holderDID: string;
   forRelationship?: string;
@@ -295,7 +331,7 @@ export async function issueCredential(params: {
         schemaId: params.schemaId,
         holderDID: params.holderDID,
         // Field name and casing exactly as specified for this integration.
-        forrelationship: params.forRelationship ?? "",
+        forRelationship: params.forRelationship ?? "",
       }),
     },
     1,

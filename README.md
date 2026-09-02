@@ -2,9 +2,20 @@
 
 A single-page website concept for Drukair walking a passenger through the
 process of getting on board the aircraft, from the check-in counter to the
-cabin seat — with a **working Bhutan NDI integration** behind the check-in step:
-the passenger proves their identity from their NDI wallet, and a credential is
-issued back to it.
+cabin seat — with a **working Bhutan NDI integration** behind two selectable
+flows (a live toggle on the page, not just a deploy-time choice):
+
+- **Online** — two stages: check-in proves the passenger's CID and issues a
+  ticket VC, then the boarding-gate step proves the ticket itself (the actual
+  Ticket Number, disclosed from that VC) and issues a boarding-pass VC.
+- **Walk-in** — one stage: proves the CID once at the counter and issues the
+  boarding-pass VC directly, with no ticket VC in between.
+
+Every credential is always issued straight to the wallet via the proof's
+relationship (no second scan to *receive* it); optionally, the online flow's
+boarding-pass *proof request* itself can also skip a fresh QR and go straight
+to the same relationship established at check-in — see `NDI_BOARDING_NO_RESCAN`
+below.
 
 Not affiliated with, or endorsed by, Drukair. The dragon mark is an original
 abstraction (wing sweep + thunder bolt), not the airline's real logo.
@@ -46,8 +57,11 @@ browser.
 | `NDI_CLIENT_ID` / `NDI_CLIENT_SECRET` | OAuth2 client credentials from the NDI team |
 | `NDI_AUTH_BASE_URL` | Auth host (`staging.bhutanndi.com`) |
 | `NDI_CLIENT_BASE_URL` | Service host (`demo-client.bhutanndi.com`) — note it differs from auth |
-| `NDI_FOUNDATIONAL_SCHEMA_URL` | Schema the holder **presents** at check-in |
-| `NDI_ISSUANCE_SCHEMA_URL` | Schema of the credential we **issue** |
+| `NDI_FOUNDATIONAL_SCHEMA_URL` | Schema the holder **presents** at both stages (a CID proof, today) |
+| `NDI_ISSUANCE_SCHEMA_URL` | Schema of the **Ticket VC**, issued at the ticket stage |
+| `NDI_BOARDING_SCHEMA_URL` | Schema of the **Boarding Pass VC**, issued at the boarding-pass stage (online) or directly (walk-in) |
+| `NDI_BOARDING_NO_RESCAN` | `true` sends the boarding-pass proof request straight to the ticket stage's relationship, skipping a fresh QR. **Unverified** — see the note in `lib/ndi/config.ts` |
+| `NEXT_PUBLIC_NDI_FLOW_UI_MODE` | Only affects the **online** flow's internal staging: `separate` (default) — two triggers, check-in then boarding gate. `continuous` — one trigger runs both stages in one popup. (Online vs walk-in itself is a live button on the page, not an env var.) |
 | `NDI_WEBHOOK_ID` | The webhookId registered with NDI |
 | `NDI_WEBHOOK_AUTH_TOKEN` | Fixed token NDI echoes back; must match registration exactly |
 | `NDI_AUTH_BEARER` | Optional. Only if your gateway wants a bearer on `/authenticate` |
@@ -66,47 +80,93 @@ which is honest, since nothing could resolve it.
 
 ## The NDI flow
 
+A radio-button toggle at the top of the journey section picks **Online
+check-in** or **Walk-in counter** — both run through the same mechanics,
+dispatched by a `kind: "ticket" | "boarding" | "walkin"` on the session (see
+`lib/ndi/sessions.ts`):
+
 ```
-Click "Login with Bhutan NDI"
-  POST /api/ndi/proof-request
+Online flow, stage 1 — ticket (Check-in)
+  POST /api/ndi/proof-request { kind: "ticket" }
     → authenticate (token cached ~24h)
     → verifier: create proof request → proofRequestURL, threadId
     → concurrently: subscribe the thread  +  build the QR matrix
-    ← { threadId, proofRequestURL, deepLinkURL, qr, subscribed }
+    ← { threadId, mode: "qr", proofRequestURL, deepLinkURL, qr, subscribed }
 
-Holder shares the proof
-  POST /webhook
+  Holder shares the proof → POST /webhook
     → constant-time check of Authorization against NDI_WEBHOOK_AUTH_TOKEN
     → correlate by thid; atomic PENDING → terminal (idempotent under retries)
     → look up the disclosed ID Number in the seed store
     → 202 to NDI immediately
-    → in the background: issue the credential to holder_did, passing
-      relationship_did as `forrelationship` so the wallet needs no second scan
+    → in the background: issue the ticket VC to holder_did, passing
+      relationship_did as `forRelationship` so the wallet needs no second scan
+    → on success, mark the record's ticket as issued (unlocks stage 2)
+
+Online flow, stage 2 — boarding pass (Boarding gate)
+  POST /api/ndi/proof-request { kind: "boarding", relationshipDid? }
+    → same as above, but the proof asks for the passenger's Ticket Number,
+      restricted to the Ticket VC schema — only satisfiable by presenting the
+      actual credential issued at stage 1, not by disclosing the CID again
+    → if NDI_BOARDING_NO_RESCAN=true and a relationshipDid was passed, the
+      request targets it directly — NDI's response then omits proofRequestURL,
+      which is what flips the popup into "push" mode (no QR shown)
+
+  Holder shares the proof → POST /webhook
+    → looks up the record by the disclosed Ticket Number (findRecordByTicketNumber),
+      not by CID — then refuses to issue (status NOT_TICKETED) unless that
+      record's ticket was already issued in stage 1
+    → on success, issues the boarding-pass VC the same way
+
+Walk-in flow — one stage (Check-in, when "Walk-in counter" is selected)
+  POST /api/ndi/proof-request { kind: "walkin" }
+    → identical mechanics to the ticket stage's proof request
+  Holder shares the proof → POST /webhook
+    → same correlation as ticket — only checks the CID is registered, with no
+      ticket-VC gate — then issues the boarding-pass VC directly
 
 GET /api/ndi/status/:threadId
   → polled by the popup; disclosed attributes delivered exactly once
     (VERIFIED → CONSUMED), issuance progress reported until it settles
 ```
 
+`NEXT_PUBLIC_NDI_FLOW_UI_MODE` decides how stage 2 is reached in the UI:
+`separate` surfaces it as its own trigger at the boarding-gate step, disabled
+until stage 1 issues; `continuous` has the check-in popup advance itself into
+stage 2 the moment the ticket is issued, without closing.
+
 ### Changing what is asked for and issued
 
-Both live in `lib/ndi/config.ts`:
+All in `lib/ndi/config.ts`:
 
-- `proofRequest.attributes` — what the holder must present. Attribute names are
-  matched **literally** by NDI, so `"ID Number"` keeps its space and capitals.
-- `proofRequest.subjectAttribute` — the attribute used to identify the
-  passenger. A validated proof that omits it is treated as a configuration
-  error, not an unknown traveller.
-- `issuance.schemaId()` — the credential being issued.
+- `ticketProofRequest` / `boardingProofRequest` / `walkinProofRequest` — what
+  the holder must present at each stage/flow. Attribute names are matched
+  **literally** by NDI, so `"ID Number"` keeps its space and capitals.
+  `subjectAttribute` is the one used to identify the passenger — a validated
+  proof that omits it is treated as a configuration error, not an unknown
+  traveller.
+- `issuance.ticket.schemaId()` / `issuance.boarding.schemaId()` — the Ticket VC
+  and Boarding Pass VC schemas respectively. Walk-in issues via
+  `issuance.boarding` too (same credential as the online flow's second stage).
+- `boarding.noRescan` — see `NDI_BOARDING_NO_RESCAN` above. Only applies to the
+  online flow's boarding stage; walk-in has no earlier relationship to reuse.
 
-Per-passenger credential data comes from `lib/ndi/records.ts`, keyed by the
-disclosed subject attribute.
+Per-passenger credential data comes from `lib/ndi/records.ts`'s
+`TICKET_FIELDS` / `BOARDING_FIELDS` and each record's `ticketData` /
+`boardingData`, keyed by the disclosed subject attribute.
 
 ### Demo data panel
 
-The section at the bottom of the page registers which ID Numbers may receive a
-credential. To use your own wallet: share a proof once, find your real ID Number
-in the `[ndi-webhook] RAW body` server log, then add it with a CIF and Bank Name.
+The section at the bottom of the page registers which CIDs may receive a
+Ticket VC and/or Boarding Pass VC. To use your own wallet: share a proof once,
+find your real ID Number in the `[ndi-webhook] RAW body` server log, then add
+it as a CID along with the Ticket VC fields (Passenger Name, Booking
+Reference, Ticket Number, Issued By, Carrier Code, Flight No, Departure Time,
+Arrival Time, Seat) and Boarding Pass VC fields (Airline, Class, Name of
+Passenger, From, To, Flight, Date, Seq. No, Boarding Time, Seat No, Gate). In
+the online flow, the same CID can then receive the boarding pass at the
+boarding-gate step, once the ticket exists; in the walk-in flow, that same
+registration is enough on its own — the boarding pass issues directly, no
+ticket VC required.
 
 ## Deployment
 

@@ -2,9 +2,28 @@ import { timingSafeEqual } from "node:crypto";
 import { NextResponse } from "next/server";
 import { mask, readAttrs } from "@/lib/ndi/attrs";
 import { NdiError, issueCredential, unsubscribeWebhook } from "@/lib/ndi/client";
-import { issuance, proofRequest, server } from "@/lib/ndi/config";
-import { type PassengerRecord, findRecordByCid } from "@/lib/ndi/records";
-import { getSession, resolveIfPending, setIssuance } from "@/lib/ndi/sessions";
+import {
+  boardingProofRequest,
+  issuance,
+  server,
+  ticketProofRequest,
+  walkinProofRequest,
+} from "@/lib/ndi/config";
+import {
+  type PassengerRecord,
+  findRecordByCid,
+  findRecordByTicketNumber,
+  markTicketIssued,
+  toIssuancePayload,
+} from "@/lib/ndi/records";
+import { type SessionKind, getSession, resolveIfPending, setIssuance } from "@/lib/ndi/sessions";
+
+/** Which proof config governs a session, keyed by its kind. */
+function proofConfigFor(kind: SessionKind) {
+  if (kind === "boarding") return boardingProofRequest;
+  if (kind === "walkin") return walkinProofRequest;
+  return ticketProofRequest;
+}
 
 export const dynamic = "force-dynamic";
 
@@ -142,21 +161,23 @@ async function handleCallback(body: Record<string, unknown>) {
         Object.keys((selfAttested ?? {}) as object).join(", "),
       );
 
-      const names = proofRequest.attributes.map((a) => a.name);
+      const proofConfig = proofConfigFor(session.kind);
+      const names = proofConfig.attributes.map((a) => a.name);
       const attributes = readAttrs(revealed, selfAttested, names);
-      const subject = attributes[proofRequest.subjectAttribute];
+      const subject = attributes[proofConfig.subjectAttribute];
 
       if (!subject) {
         // A validated proof that discloses nothing usable is nearly always a
         // schema or attribute-name mismatch on our side, not a real refusal.
         console.error(
-          "[ndi-webhook] validated proof disclosed no %s (thread=%s) — check the schema URL and attribute names in lib/ndi/config.ts",
-          proofRequest.subjectAttribute,
+          "[ndi-webhook] validated proof disclosed no %s (thread=%s kind=%s) — check the schema URL and attribute names in lib/ndi/config.ts",
+          proofConfig.subjectAttribute,
           thid,
+          session.kind,
         );
         if (
           resolveIfPending(thid, "FAILED", {
-            reason: `Proof did not include ${proofRequest.subjectAttribute}`,
+            reason: `Proof did not include ${proofConfig.subjectAttribute}`,
           })
         ) {
           void unsubscribeWebhook(thid);
@@ -172,9 +193,29 @@ async function handleCallback(body: Record<string, unknown>) {
       // PENDING→terminal transition as the proof result itself — a passenger
       // with no matching record is a distinct outcome from a valid proof, not a
       // second phase of it.
-      const record = findRecordByCid(subject);
+      //
+      // Boarding looks up by Ticket Number (the subject it actually asked
+      // for), not CID — ticket and walk-in still ask for, and match on, CID.
+      const record =
+        session.kind === "boarding" ? findRecordByTicketNumber(subject) : findRecordByCid(subject);
 
-      const resolved = resolveIfPending(thid, record ? "VERIFIED" : "NOT_REGISTERED", {
+      // Boarding must follow ticket: a registered CID with no ticket VC yet is
+      // a distinct outcome from "not registered at all", not a silent skip.
+      // `ticket` and `walkin` both only need the CID itself to be registered —
+      // walk-in has no earlier stage to gate on.
+      const resolvedStatus =
+        session.kind === "boarding"
+          ? !record
+            ? "NOT_REGISTERED"
+            : !record.ticketIssuedAt
+              ? "NOT_TICKETED"
+              : "VERIFIED"
+          : record
+            ? "VERIFIED"
+            : "NOT_REGISTERED";
+      const canIssue = resolvedStatus === "VERIFIED";
+
+      const resolved = resolveIfPending(thid, resolvedStatus, {
         attributes,
         holderDid,
         relationshipDid,
@@ -184,18 +225,19 @@ async function handleCallback(body: Record<string, unknown>) {
 
       void unsubscribeWebhook(thid); // fire-and-forget: don't delay the 202
       console.log(
-        "[ndi-webhook] proof validated thread=%s %s=%s holder=%s registered=%s",
+        "[ndi-webhook] proof validated thread=%s kind=%s %s=%s holder=%s status=%s",
         thid,
-        proofRequest.subjectAttribute,
+        session.kind,
+        proofConfig.subjectAttribute,
         mask(subject),
         mask(holderDid, 8),
-        Boolean(record),
+        resolvedStatus,
       );
 
-      if (!record) {
+      if (!record || !canIssue) {
         console.warn(
-          "[ndi-webhook] no record for %s (thread=%s) — nothing to issue",
-          mask(subject),
+          "[ndi-webhook] %s (thread=%s) — nothing to issue",
+          resolvedStatus,
           thid,
         );
         return;
@@ -214,7 +256,7 @@ async function handleCallback(body: Record<string, unknown>) {
       // start it after the 202 is already on its way, and let /api/ndi/status
       // report progress via polling.
       setIssuance(thid, { status: "issuing" });
-      void issueForRecord(thid, record, holderDid, relationshipDid);
+      void issueForRecord(thid, session.kind, record, holderDid, relationshipDid);
       return;
     }
 
@@ -234,19 +276,39 @@ async function handleCallback(body: Record<string, unknown>) {
  */
 async function issueForRecord(
   thid: string,
+  kind: SessionKind,
   record: PassengerRecord,
   holderDid: string,
   relationshipDid: string | null,
 ) {
   try {
+    // Boarding falls back to the relationship captured at the ticket step if
+    // this particular proof somehow didn't carry one (e.g. a pushed request
+    // NDI answered without echoing relationship_did back). Walk-in has no
+    // earlier relationship to fall back to — it's always a fresh one.
+    const forRelationship =
+      relationshipDid ?? (kind === "boarding" ? record.ticketRelationshipDid : null) ?? "";
+
+    // Walk-in issues the same boarding-pass credential as the online flow's
+    // second stage, just without a ticket VC ever having existed for this CID.
+    const schemaId =
+      kind === "ticket" ? issuance.ticket.schemaId() : issuance.boarding.schemaId();
+    const credentialData = kind === "ticket" ? record.ticketData : record.boardingData;
+
     const result = await issueCredential({
-      credentialData: record.credentialData,
-      schemaId: issuance.schemaId(),
+      credentialData: toIssuancePayload(credentialData),
+      schemaId,
       holderDID: holderDid,
       // Passing the relationship we already have is what lets NDI push this
       // straight to the wallet — no second QR to scan.
-      forRelationship: relationshipDid ?? "",
+      forRelationship,
     });
+
+    // Unlocks the boarding-pass stage for this CID — only the ticket stage
+    // does this; boarding issuance has nothing further to gate.
+    if (kind === "ticket") {
+      markTicketIssued(record.cid, relationshipDid);
+    }
 
     setIssuance(thid, {
       status: "issued",
@@ -256,10 +318,11 @@ async function issueForRecord(
       revocationId: result.revocationId,
     });
     console.log(
-      "[ndi-webhook] credential issued thread=%s issueCredThreadId=%s viaExistingRelationship=%s",
+      "[ndi-webhook] %s credential issued thread=%s issueCredThreadId=%s viaExistingRelationship=%s",
+      kind,
       thid,
       result.issueCredThreadId,
-      Boolean(relationshipDid),
+      Boolean(forRelationship),
     );
   } catch (error) {
     const detail =

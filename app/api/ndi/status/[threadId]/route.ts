@@ -11,6 +11,7 @@ export const dynamic = "force-dynamic";
  *   { status: "verified", attributes, holderDid, relationshipDid, issuance } — delivered once
  *   { status: "consumed", issuance }              — every poll after the first
  *   { status: "not_registered" }                   — proof OK, no matching record
+ *   { status: "not_ticketed" }        — boarding proof OK, but no ticket VC issued yet
  *   { status: "declined" }
  *   { status: "failed", reason }
  *   { status: "expired" }
@@ -61,6 +62,10 @@ export async function GET(
 
   if (session.status === "NOT_REGISTERED") {
     return NextResponse.json({ status: "not_registered" });
+  }
+
+  if (session.status === "NOT_TICKETED") {
+    return NextResponse.json({ status: "not_ticketed" });
   }
 
   if (session.status === "REJECTED") return NextResponse.json({ status: "declined" });

@@ -8,6 +8,7 @@ import {
   useSpring,
 } from "framer-motion";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { flowUiMode } from "@/lib/ndi/config";
 import { PlaneGlyph } from "./Brand";
 import NdiButton from "./ndi/NdiButton";
 import NdiScanModal from "./ndi/NdiScanModal";
@@ -20,7 +21,7 @@ const STEPS = [
     code: "01",
     title: "Check-in",
     blurb:
-      "Prove who you are with your Bhutan NDI wallet. Scan the code, share the requested credential, and check-in completes.",
+      "Prove who you are with your Bhutan NDI wallet to get your ticket as a verifiable credential. Scan the code, share the requested credential, and check-in completes.",
     meta: ["Bhutan NDI", "T-90 min"],
   },
   {
@@ -44,7 +45,8 @@ const STEPS = [
   {
     code: "05",
     title: "Boarding gate",
-    blurb: "Placeholder copy for the boarding gate and pass scan stage.",
+    blurb:
+      "Present your ticket VC once more to receive your boarding pass as a verifiable credential.",
     meta: ["Gate 2", "T-25 min"],
   },
   {
@@ -54,6 +56,8 @@ const STEPS = [
     meta: ["Onboard", "T-10 min"],
   },
 ] as const;
+
+const BOARDING_STEP_INDEX = 4;
 
 const RAIL =
   "M 46 182 C 190 62, 336 62, 476 142 C 616 222, 754 220, 890 118 C 968 60, 1064 52, 1158 82";
@@ -72,6 +76,20 @@ export default function OnboardingJourney() {
   const [playing, setPlaying] = useState(true);
   const [held, setHeld] = useState(false);
   const [ndiOpen, setNdiOpen] = useState(false);
+  /** Which NDI stage the (single, reused) modal instance is currently running.
+   *  "separate" UI mode opens each stage from its own step; "continuous" mode
+   *  only ever opens "ticket" — the modal advances itself from there. */
+  const [ndiKind, setNdiKind] = useState<"ticket" | "boarding" | "walkin">("ticket");
+  /** Set once the ticket stage issues, unlocking the boarding-gate trigger in
+   *  "separate" mode and carrying the relationship forward for a possible
+   *  no-rescan push. Irrelevant to the walk-in flow — it has no ticket stage. */
+  const [ticket, setTicket] = useState<{ relationshipDid: string | null } | null>(null);
+  /** The online flow is the two-stage one built first (ticket → boarding
+   *  pass); walk-in proves CID once at the counter and gets the boarding pass
+   *  directly, with no ticket VC in between. A live toggle, not just an env
+   *  setting, so the demo can show either. */
+  const [flowType, setFlowType] = useState<"online" | "walkin">("online");
+  const uiMode = flowUiMode();
 
   const progress = useSpring(0, {
     stiffness: reduce ? 400 : 46,
@@ -157,6 +175,15 @@ export default function OnboardingJourney() {
   };
 
   const step = STEPS[active];
+  /** Step 0 and the boarding-gate step read differently depending on which
+   *  flow is selected — overridden here rather than baked into STEPS, since
+   *  the rest of that array (titles, tablist, icons) doesn't change with it. */
+  const blurb =
+    active === 0 && flowType === "walkin"
+      ? "Walk-in passengers verify their CID once at the counter — a boarding pass is issued straight to the wallet, with no separate ticket VC."
+      : active === BOARDING_STEP_INDEX && flowType === "walkin"
+        ? "Not used for walk-in passengers — their boarding pass was already issued at check-in."
+        : step.blurb;
 
   return (
     <section
@@ -192,6 +219,43 @@ export default function OnboardingJourney() {
               />
               {playing ? "Auto" : "Manual"}
             </button>
+          </div>
+        </Reveal>
+
+        {/* Which NDI flow this demo runs: online (ticket VC, then a separate
+            boarding-pass VC) or walk-in (boarding pass issued directly off
+            the CID proof, no ticket VC involved). */}
+        <Reveal delay={0.05}>
+          <div
+            role="radiogroup"
+            aria-label="NDI flow"
+            className="border-haze-200 mt-6 inline-flex rounded-full border bg-white p-1"
+          >
+            {(
+              [
+                { key: "online", label: "Online check-in" },
+                { key: "walkin", label: "Walk-in counter" },
+              ] as const
+            ).map(({ key, label }) => (
+              <button
+                key={key}
+                type="button"
+                role="radio"
+                aria-checked={flowType === key}
+                onClick={() => {
+                  setFlowType(key);
+                  setTicket(null);
+                  setNdiOpen(false);
+                }}
+                className={`rounded-full px-4 py-2 font-mono text-[11px] tracking-[0.16em] uppercase transition-colors ${
+                  flowType === key
+                    ? "bg-saffron-500/10 text-saffron-600"
+                    : "text-ink-400 hover:text-ink-900"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
           </div>
         </Reveal>
 
@@ -408,7 +472,7 @@ export default function OnboardingJourney() {
                     {step.title}
                   </h3>
                   <p className="text-ink-500 mt-4 max-w-xl leading-relaxed">
-                    {step.blurb}
+                    {blurb}
                   </p>
                   <div className="mt-6 flex flex-wrap gap-2">
                     {step.meta.map((m) => (
@@ -422,13 +486,48 @@ export default function OnboardingJourney() {
                   </div>
 
                   {/* Check-in is the live step: it opens a real Bhutan NDI
-                      proof request. */}
+                      proof request. Online + "continuous" mode has this
+                      single trigger also carry the flow through the
+                      boarding-pass stage; walk-in issues the boarding pass
+                      directly off this same step, in one proof. */}
                   {active === 0 && (
                     <div className="border-haze-200 mt-8 border-t pt-6">
                       <p className="text-ink-400 mb-3 font-mono text-[10px] tracking-[0.2em] uppercase">
                         Verify with Bhutan National Digital Identity
                       </p>
-                      <NdiButton onClick={() => setNdiOpen(true)} />
+                      <NdiButton
+                        onClick={() => {
+                          setNdiKind(flowType === "walkin" ? "walkin" : "ticket");
+                          setNdiOpen(true);
+                        }}
+                      />
+                    </div>
+                  )}
+
+                  {/* Boarding gate only carries its own trigger for the
+                      online flow in "separate" mode — "continuous" mode
+                      already reached this stage inside the check-in modal,
+                      and walk-in never needs it at all, since its boarding
+                      pass was issued at step 0. Disabled until a ticket VC
+                      has actually been issued this session. */}
+                  {active === BOARDING_STEP_INDEX && flowType === "online" && uiMode === "separate" && (
+                    <div className="border-haze-200 mt-8 border-t pt-6">
+                      <p className="text-ink-400 mb-3 font-mono text-[10px] tracking-[0.2em] uppercase">
+                        Verify with Bhutan National Digital Identity
+                      </p>
+                      {ticket ? (
+                        <NdiButton
+                          label="Get boarding pass"
+                          onClick={() => {
+                            setNdiKind("boarding");
+                            setNdiOpen(true);
+                          }}
+                        />
+                      ) : (
+                        <p className="text-ink-400 text-sm">
+                          Complete check-in first to unlock your boarding pass.
+                        </p>
+                      )}
                     </div>
                   )}
                 </div>
@@ -440,7 +539,14 @@ export default function OnboardingJourney() {
 
       {/* Mounted only while open so it always opens on a fresh proof request. */}
       <AnimatePresence>
-        {ndiOpen && <NdiScanModal onClose={() => setNdiOpen(false)} />}
+        {ndiOpen && (
+          <NdiScanModal
+            kind={ndiKind}
+            linkedRelationshipDid={ticket?.relationshipDid ?? null}
+            onClose={() => setNdiOpen(false)}
+            onTicketIssued={setTicket}
+          />
+        )}
       </AnimatePresence>
     </section>
   );

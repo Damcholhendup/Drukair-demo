@@ -36,12 +36,19 @@ export const server = {
       "https://dev-schema.ngotag.com/schemas/c7952a0a-e9b5-4a4b-a714-1e5d0a1ae076"
     );
   },
-  /** The credential we ISSUE once check-in succeeds. Defaults to the bank demo
-   *  schema used to prove out the issuance mechanics before a real one exists. */
+  /** The Ticket VC — issued once the ticket step succeeds. */
   get issuanceSchemaUrl() {
     return (
-      process.env.NDI_ISSUANCE_SCHEMA_URL ??
-      "https://dev-schema.ngotag.com/schemas/61179c5f-44f4-4380-ae37-ff3b1f093288"
+      process.env.NDI_ISSUANCE_SCHEMA_URL ||
+      "https://dev-schema.ngotag.com/schemas/9e3c9c24-5b19-49b0-9af9-d44770b70124"
+    );
+  },
+  /** The Boarding Pass VC — issued once the boarding-pass step (online flow)
+   *  or the single walk-in step succeeds. */
+  get boardingSchemaUrl() {
+    return (
+      process.env.NDI_BOARDING_SCHEMA_URL ||
+      "https://dev-schema.ngotag.com/schemas/8aef1837-98d6-437b-b682-53866d4e0e27"
     );
   },
   /** Optional; see .env.example. */
@@ -84,6 +91,49 @@ export function isWebhookConfigured(): boolean {
 }
 
 /**
+ * Boarding pass is the second stage: prove a ticket number (placeholder: CID
+ * again, until a real ticket-VC schema exists), then issue a boarding pass.
+ */
+export const boarding = {
+  /**
+   * When true, the boarding-pass proof request targets the relationship_did
+   * already established at the ticket step instead of minting a fresh
+   * invitation — the holder is never asked to scan a second QR.
+   *
+   * Confirmed live against NDI staging that `verifier/v1/proof-request` DOES
+   * read and validate this field (sent as `forRelationship`, matching
+   * issuer/v1/issue-credential): a non-UUID value 400s with "connectionId
+   * must be a UUID", and a syntactically valid but nonexistent UUID gets past
+   * that into a 500 "Rpc Exception" trying to resolve it — the same two-layer
+   * failure shape `issueCredential` hits with a fake relationship_did. That's
+   * strong evidence a REAL relationship_did (itself a UUID, e.g. one already
+   * seen in a webhook payload) succeeds — just not proven with an actual push
+   * delivered to a wallet yet. Safe to enable regardless: `createProofRequest`
+   * only claims "push" mode when NDI's response omits a proofRequestURL, so a
+   * failure here would surface as an error, never a silent bad state.
+   */
+  get noRescan() {
+    return process.env.NDI_BOARDING_NO_RESCAN === "true";
+  },
+} as const;
+
+/**
+ * Which UI structure presents the two NDI stages. Read on the client too
+ * (journey layout depends on it), so this is the one flow setting that's
+ * NEXT_PUBLIC — everything else that's actually sensitive or server-decided
+ * (schemas, no-rescan) stays server-only.
+ *
+ *   "separate"   — two distinct triggers in the journey (check-in, then a
+ *                  later boarding-gate step), each opening its own popup.
+ *   "continuous" — one trigger runs both stages back-to-back in one popup.
+ */
+export function flowUiMode(): "separate" | "continuous" {
+  return process.env.NEXT_PUBLIC_NDI_FLOW_UI_MODE === "continuous"
+    ? "continuous"
+    : "separate";
+}
+
+/**
  * How long a started check-in stays valid. The NDI proof itself lapses in about
  * five minutes, so there is no point holding a session much longer.
  */
@@ -103,7 +153,7 @@ export const SESSION_TTL_MS = Math.max(
 /* -------------------------------------------------------------------------- */
 
 /**
- * What we ask the passenger to present at check-in.
+ * What we ask the passenger to present at the TICKET step (Step 1).
  *
  * This is the single place to change when the use case firms up: add or remove
  * attributes here and the proof request, the webhook reader and the status
@@ -112,7 +162,7 @@ export const SESSION_TTL_MS = Math.max(
  * `name` must match the schema attribute exactly — NDI matches literally, so
  * "ID Number" keeps its space and capitalisation.
  */
-export const proofRequest = {
+export const ticketProofRequest = {
   proofName: "G2C",
   purpose: "login",
   attributes: [
@@ -128,12 +178,49 @@ export const proofRequest = {
 } as const;
 
 /**
+ * What we ask the passenger to present in the WALK-IN flow: a CID proof,
+ * identical in shape to the ticket stage's — the walk-in flow just issues the
+ * boarding-pass credential straight off it, with no ticket VC in between. Its
+ * own export (rather than reusing `ticketProofRequest`) so it can be tuned
+ * independently later without touching the online flow.
+ */
+export const walkinProofRequest = {
+  proofName: "G2C",
+  purpose: "login",
+  attributes: [
+    { name: "ID Number", schemaUrl: () => server.foundationalSchemaUrl },
+  ],
+  subjectAttribute: "ID Number",
+} as const;
+
+/**
+ * What we ask the passenger to present at the BOARDING-PASS step (Step 2):
+ * their Ticket Number, restricted to the Ticket VC schema itself — so this is
+ * only satisfiable by presenting the actual credential issued at step 1, not
+ * just re-disclosing the CID. The lookup this feeds (see
+ * `findRecordByTicketNumber` in lib/ndi/records.ts) matches on that value,
+ * not on CID, which is what makes this genuinely "prove your ticket" rather
+ * than "prove your identity again".
+ */
+export const boardingProofRequest = {
+  proofName: "G2C",
+  // NDI validates `purpose` against a fixed enum — confirmed directly against
+  // staging: login | ekyc | ekyc_update | otp. "boarding" 400s. `login` is the
+  // closest fit until a real ticket-number verification purpose exists.
+  purpose: "login",
+  attributes: [{ name: "Ticket Number", schemaUrl: () => server.issuanceSchemaUrl }],
+  subjectAttribute: "Ticket Number",
+} as const;
+
+/**
  * What we ISSUE once the passenger's proof matches a record in
  * lib/ndi/records.ts. `credentialData` itself isn't here — it's per-passenger,
- * so it comes from the matched record — only the schema is fixed per deployment.
+ * so it comes from the matched record (`ticketData` / `boardingData`) — only
+ * the schema is fixed per deployment.
  */
 export const issuance = {
-  schemaId: () => server.issuanceSchemaUrl,
+  ticket: { schemaId: () => server.issuanceSchemaUrl },
+  boarding: { schemaId: () => server.boardingSchemaUrl },
 } as const;
 
 /**

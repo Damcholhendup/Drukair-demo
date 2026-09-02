@@ -4,9 +4,11 @@ import { useCallback, useEffect, useState } from "react";
 
 type RecordRow = {
   cid: string;
-  credentialData: Record<string, string>;
+  ticketData: Record<string, string>;
+  boardingData: Record<string, string>;
   source: "seed" | "manual";
   addedAt: number;
+  ticketIssuedAt?: number;
 };
 
 type Rows =
@@ -14,18 +16,61 @@ type Rows =
   | { status: "ready"; records: RecordRow[] }
   | { status: "error"; message: string };
 
-const EMPTY_FORM = { cid: "", cif: "", bankName: "" };
+/**
+ * Field key -> schema attribute name/placeholder, mirroring TICKET_FIELDS /
+ * BOARDING_FIELDS in lib/ndi/records.ts. Duplicated here rather than imported
+ * — that module is `server-only` and can't be pulled into a client component
+ * — so a schema change means updating both places.
+ */
+const TICKET_FORM_FIELDS = [
+  { key: "passengerName", label: "Passenger Name", placeholder: "Demo Passenger" },
+  { key: "bookingReference", label: "Booking Reference", placeholder: "BR12345" },
+  { key: "ticketNumber", label: "Ticket Number", placeholder: "TKT001" },
+  { key: "issuedBy", label: "Issued By", placeholder: "Drukair" },
+  { key: "carrierCode", label: "Carrier Code", placeholder: "KB" },
+  { key: "flightNo", label: "Flight No", placeholder: "KB101" },
+  { key: "departureTime", label: "Departure Time", placeholder: "09:00" },
+  { key: "arrivalTime", label: "Arrival Time", placeholder: "11:00" },
+  { key: "seat", label: "Seat", placeholder: "12A" },
+] as const;
+
+const BOARDING_FORM_FIELDS = [
+  { key: "airline", label: "Airline", placeholder: "Drukair" },
+  { key: "travelClass", label: "Class", placeholder: "Economy" },
+  { key: "nameOfPassenger", label: "Name of Passenger", placeholder: "Demo Passenger" },
+  { key: "from", label: "From", placeholder: "Paro" },
+  { key: "to", label: "To", placeholder: "Bangkok" },
+  { key: "flight", label: "Flight", placeholder: "KB101" },
+  { key: "date", label: "Date", placeholder: "2026-08-19" },
+  { key: "seqNo", label: "Seq. No", placeholder: "045" },
+  { key: "boardingTime", label: "Boarding Time", placeholder: "08:30" },
+  { key: "seatNo", label: "Seat No", placeholder: "12A" },
+  { key: "gate", label: "Gate", placeholder: "Gate 2" },
+] as const;
+
+/** The schema attribute names, in display order, for table columns. */
+const TICKET_COLUMNS = TICKET_FORM_FIELDS.map((f) => f.label);
+const BOARDING_COLUMNS = BOARDING_FORM_FIELDS.map((f) => f.label);
+
+const emptyOf = (fields: readonly { key: string }[]) =>
+  Object.fromEntries(fields.map((f) => [f.key, ""])) as Record<string, string>;
 
 /**
- * Demo-only panel for seeding which ID Numbers are allowed to receive a
- * credential. Sits at the bottom of the page and is intentionally styled as a
- * utility rather than part of the Drukair experience.
+ * Demo-only panel for seeding which CIDs can be issued the Ticket VC and/or
+ * Boarding Pass VC. Sits at the bottom of the page and is intentionally
+ * styled as a utility rather than part of the Drukair experience.
  *
  * The backing store is in memory, so entries last until the server restarts.
  */
 export default function SeedRecords() {
   const [rows, setRows] = useState<Rows>({ status: "loading" });
-  const [form, setForm] = useState(EMPTY_FORM);
+  const [cid, setCid] = useState("");
+  const [ticket, setTicket] = useState<Record<string, string>>(() =>
+    emptyOf(TICKET_FORM_FIELDS),
+  );
+  const [boarding, setBoarding] = useState<Record<string, string>>(() =>
+    emptyOf(BOARDING_FORM_FIELDS),
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -68,17 +113,17 @@ export default function SeedRecords() {
       const res = await fetch("/api/records", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(form),
+        body: JSON.stringify({ cid, ticket, boarding }),
       });
       const body = await res.json();
       if (!res.ok) throw new Error(body?.error ?? `Failed (${res.status})`);
       setRows({ status: "ready", records: body.records as RecordRow[] });
       setNotice(
-        body.replaced
-          ? `Updated ${body.record.cid}`
-          : `Added ${body.record.cid}`,
+        body.replaced ? `Updated ${body.record.cid}` : `Added ${body.record.cid}`,
       );
-      setForm(EMPTY_FORM);
+      setCid("");
+      setTicket(emptyOf(TICKET_FORM_FIELDS));
+      setBoarding(emptyOf(BOARDING_FORM_FIELDS));
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not save");
     } finally {
@@ -86,18 +131,18 @@ export default function SeedRecords() {
     }
   }
 
-  async function remove(cid: string) {
+  async function remove(recordCid: string) {
     setBusy(true);
     setError(null);
     setNotice(null);
     try {
-      const res = await fetch(`/api/records?cid=${encodeURIComponent(cid)}`, {
+      const res = await fetch(`/api/records?cid=${encodeURIComponent(recordCid)}`, {
         method: "DELETE",
       });
       const body = await res.json();
       if (!res.ok) throw new Error(body?.error ?? `Failed (${res.status})`);
       setRows({ status: "ready", records: body.records as RecordRow[] });
-      setNotice(`Removed ${cid}`);
+      setNotice(`Removed ${recordCid}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not remove");
     } finally {
@@ -120,55 +165,74 @@ export default function SeedRecords() {
           </span>
         </div>
         <p className="text-ink-500 mt-2 max-w-2xl text-sm leading-relaxed">
-          Registers which ID Numbers can be issued a credential at check-in.
-          When a passenger&apos;s proof discloses an ID Number listed here, the
-          matching CIF and Bank Name are issued to their wallet. Stored in
-          memory — entries clear when the server restarts.
+          Registers which CIDs can be issued a Ticket VC and/or Boarding Pass
+          VC. In the online flow, the Ticket VC is issued at check-in and the
+          Boarding Pass VC only after that, at the boarding-gate step. In the
+          walk-in flow, the Boarding Pass VC is issued directly — no Ticket VC
+          required. Stored in memory — entries clear when the server restarts.
         </p>
 
-        <form
-          onSubmit={add}
-          className="mt-8 grid gap-3 sm:grid-cols-[1.2fr_0.8fr_1fr_auto] sm:items-end"
-        >
-          <label className="block">
+        <form onSubmit={add} className="mt-8 space-y-6">
+          <label className="block max-w-xs">
             <span className="text-ink-400 mb-1.5 block font-mono text-[10px] tracking-[0.18em] uppercase">
-              ID Number
+              CID
             </span>
             <input
               className={field}
-              value={form.cid}
-              onChange={(e) => setForm({ ...form, cid: e.target.value })}
-              placeholder="11305003415"
+              value={cid}
+              onChange={(e) => setCid(e.target.value)}
+              placeholder="10402000479"
               maxLength={64}
               required
             />
           </label>
-          <label className="block">
-            <span className="text-ink-400 mb-1.5 block font-mono text-[10px] tracking-[0.18em] uppercase">
-              CIF
-            </span>
-            <input
-              className={field}
-              value={form.cif}
-              onChange={(e) => setForm({ ...form, cif: e.target.value })}
-              placeholder="1234"
-              maxLength={64}
-              required
-            />
-          </label>
-          <label className="block">
-            <span className="text-ink-400 mb-1.5 block font-mono text-[10px] tracking-[0.18em] uppercase">
-              Bank Name
-            </span>
-            <input
-              className={field}
-              value={form.bankName}
-              onChange={(e) => setForm({ ...form, bankName: e.target.value })}
-              placeholder="BOB"
-              maxLength={64}
-              required
-            />
-          </label>
+
+          <fieldset>
+            <legend className="text-ink-400 mb-3 font-mono text-[10px] tracking-[0.2em] uppercase">
+              Ticket VC fields
+            </legend>
+            <div className="grid gap-3 sm:grid-cols-3">
+              {TICKET_FORM_FIELDS.map(({ key, label, placeholder }) => (
+                <label key={key} className="block">
+                  <span className="text-ink-400 mb-1.5 block font-mono text-[10px] tracking-[0.18em] uppercase">
+                    {label}
+                  </span>
+                  <input
+                    className={field}
+                    value={ticket[key]}
+                    onChange={(e) => setTicket({ ...ticket, [key]: e.target.value })}
+                    placeholder={placeholder}
+                    maxLength={64}
+                    required
+                  />
+                </label>
+              ))}
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend className="text-ink-400 mb-3 font-mono text-[10px] tracking-[0.2em] uppercase">
+              Boarding pass VC fields
+            </legend>
+            <div className="grid gap-3 sm:grid-cols-3">
+              {BOARDING_FORM_FIELDS.map(({ key, label, placeholder }) => (
+                <label key={key} className="block">
+                  <span className="text-ink-400 mb-1.5 block font-mono text-[10px] tracking-[0.18em] uppercase">
+                    {label}
+                  </span>
+                  <input
+                    className={field}
+                    value={boarding[key]}
+                    onChange={(e) => setBoarding({ ...boarding, [key]: e.target.value })}
+                    placeholder={placeholder}
+                    maxLength={64}
+                    required
+                  />
+                </label>
+              ))}
+            </div>
+          </fieldset>
+
           <button
             type="submit"
             disabled={busy}
@@ -197,13 +261,19 @@ export default function SeedRecords() {
           )}
           {rows.status === "ready" && rows.records.length > 0 && (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[520px] text-left text-sm">
+              <table className="w-full min-w-[1600px] text-left text-sm">
                 <thead>
                   <tr className="border-haze-200 text-ink-400 border-b">
-                    {["ID Number", "CIF", "Bank Name", ""].map((h, i) => (
+                    {[
+                      "CID",
+                      "Ticket",
+                      ...TICKET_COLUMNS,
+                      ...BOARDING_COLUMNS,
+                      "",
+                    ].map((h, i) => (
                       <th
                         key={h || i}
-                        className="px-5 py-3 font-mono text-[10px] font-normal tracking-[0.18em] uppercase"
+                        className="px-5 py-3 font-mono text-[10px] font-normal whitespace-nowrap tracking-[0.18em] uppercase"
                       >
                         {h}
                       </th>
@@ -216,7 +286,7 @@ export default function SeedRecords() {
                       key={r.cid}
                       className="border-haze-200 border-b last:border-0"
                     >
-                      <td className="text-ink-900 px-5 py-3 font-mono">
+                      <td className="text-ink-900 px-5 py-3 font-mono whitespace-nowrap">
                         {r.cid}
                         {r.source === "seed" && (
                           <span className="text-ink-400 ml-2 font-sans text-[10px] tracking-wider uppercase">
@@ -224,18 +294,29 @@ export default function SeedRecords() {
                           </span>
                         )}
                       </td>
-                      <td className="text-ink-700 px-5 py-3 font-mono">
-                        {r.credentialData["CIF"] ?? "—"}
+                      <td className="px-5 py-3 whitespace-nowrap">
+                        {r.ticketIssuedAt ? (
+                          <span className="text-saffron-600 font-semibold">Issued</span>
+                        ) : (
+                          <span className="text-ink-400">—</span>
+                        )}
                       </td>
-                      <td className="text-ink-700 px-5 py-3 font-mono">
-                        {r.credentialData["Bank Name"] ?? "—"}
-                      </td>
+                      {TICKET_COLUMNS.map((col) => (
+                        <td key={col} className="text-ink-700 px-5 py-3 font-mono whitespace-nowrap">
+                          {r.ticketData[col] ?? "—"}
+                        </td>
+                      ))}
+                      {BOARDING_COLUMNS.map((col) => (
+                        <td key={col} className="text-ink-700 px-5 py-3 font-mono whitespace-nowrap">
+                          {r.boardingData[col] ?? "—"}
+                        </td>
+                      ))}
                       <td className="px-5 py-3 text-right">
                         <button
                           type="button"
                           onClick={() => remove(r.cid)}
                           disabled={busy}
-                          className="text-ink-400 hover:text-red-600 text-xs font-semibold transition-colors disabled:opacity-50"
+                          className="text-ink-400 hover:text-red-600 text-xs font-semibold whitespace-nowrap transition-colors disabled:opacity-50"
                         >
                           Remove
                         </button>

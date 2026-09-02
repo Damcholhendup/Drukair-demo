@@ -9,7 +9,22 @@ export type SessionStatus =
   | "REJECTED"
   | "FAILED"
   /** Proof validated, but the disclosed CID matched no record in lib/ndi/records.ts. */
-  | "NOT_REGISTERED";
+  | "NOT_REGISTERED"
+  /** Proof validated and the CID is registered, but this is a `boarding`
+   *  session and that CID has no ticket VC issued yet. */
+  | "NOT_TICKETED";
+
+/** Which stage/flow this session belongs to — decides how the webhook
+ *  interprets the proof and what it issues. See lib/ndi/config.ts.
+ *
+ *   ticket   — online flow, stage 1: proves CID, issues the ticket VC.
+ *   boarding — online flow, stage 2: proves the ticket, issues the boarding
+ *              pass VC. Refused unless that CID's ticket was already issued.
+ *   walkin   — walk-in flow: proves CID, issues the boarding pass VC directly.
+ *              Same mechanics as `ticket`, just issuing the other schema and
+ *              skipping the ticket entirely — there is no earlier stage to gate on.
+ */
+export type SessionKind = "ticket" | "boarding" | "walkin";
 
 /**
  * Progress of the follow-on credential issuance, tracked separately from
@@ -31,6 +46,7 @@ export type IssuanceState =
 
 export type CheckInSession = {
   threadId: string;
+  kind: SessionKind;
   status: SessionStatus;
   createdAt: number;
   resolvedAt?: number;
@@ -98,10 +114,11 @@ function ensurePurgeTimer() {
   globalForNdi.__ndiPurgeTimer = timer;
 }
 
-export function createSession(threadId: string): CheckInSession {
+export function createSession(threadId: string, kind: SessionKind): CheckInSession {
   ensurePurgeTimer();
   const session: CheckInSession = {
     threadId,
+    kind,
     status: "PENDING",
     createdAt: Date.now(),
   };

@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import {
-  CREDENTIAL_FIELDS,
+  BOARDING_FIELDS,
   MAX_RECORDS,
+  TICKET_FIELDS,
   listRecords,
   removeRecord,
   upsertRecord,
@@ -21,13 +22,30 @@ export const dynamic = "force-dynamic";
 export async function GET() {
   return NextResponse.json({
     records: listRecords(),
-    fields: CREDENTIAL_FIELDS,
+    ticketFields: TICKET_FIELDS,
+    boardingFields: BOARDING_FIELDS,
     max: MAX_RECORDS,
   });
 }
 
+/** Pulls every TICKET_FIELDS/BOARDING_FIELDS key out of a sub-object,
+ *  defaulting anything missing or non-string to "" — validated properly by
+ *  upsertRecord, which is the single source of truth for what's required. */
+function strings<K extends string>(
+  fieldMap: Record<K, string>,
+  source: unknown,
+): Record<K, string> {
+  const obj = (source && typeof source === "object" ? source : {}) as Record<string, unknown>;
+  const out = {} as Record<K, string>;
+  for (const key of Object.keys(fieldMap) as K[]) {
+    const value = obj[key];
+    out[key] = typeof value === "string" ? value : "";
+  }
+  return out;
+}
+
 export async function POST(request: Request) {
-  let body: { cid?: unknown; cif?: unknown; bankName?: unknown };
+  let body: { cid?: unknown; ticket?: unknown; boarding?: unknown };
   try {
     body = (await request.json()) as typeof body;
   } catch {
@@ -36,8 +54,8 @@ export async function POST(request: Request) {
 
   const result = upsertRecord({
     cid: typeof body.cid === "string" ? body.cid : "",
-    cif: typeof body.cif === "string" ? body.cif : "",
-    bankName: typeof body.bankName === "string" ? body.bankName : "",
+    ticket: strings(TICKET_FIELDS, body.ticket),
+    boarding: strings(BOARDING_FIELDS, body.boarding),
   });
 
   if (!result.ok) {
