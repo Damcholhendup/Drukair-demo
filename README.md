@@ -232,7 +232,7 @@ components/
   Brand.tsx                        DragonMark, Wordmark, PlaneGlyph, PrayerRibbon
   SiteNav.tsx                      transparent over the video, white once scrolled
   Hero.tsx                         full-bleed video, headline, playback control
-  OnboardingJourney.tsx            six-step flight-path rail; hosts the NDI trigger
+  OnboardingJourney.tsx            two-step flight-path rail; hosts the NDI triggers and flow toggle
   BoardingPass.tsx                 tilting pass, gate-scan animation
   SeedRecords.tsx                  demo data panel
   ndi/NdiButton.tsx                spec-compliant NDI button
@@ -265,10 +265,12 @@ the YouTube tutorial URL, and the official store badges.
   and scales slightly on scroll, and the copy fades out as you leave. A pause
   button sits bottom-right, because background motion running longer than five
   seconds needs a way to stop it.
-- **Journey rail** — six stages sit on an SVG curve. The aircraft flies between
-  them along the real path geometry (`getPointAtLength`), offset onto the path
-  normal so it never covers a stage marker. Auto-advances every 4.6s, pauses on
-  hover/focus or while the NDI popup is open, and has an Auto/Manual toggle.
+- **Journey rail** — the two real stages (check-in, boarding gate) sit on an
+  SVG curve. The aircraft flies between them along the real path geometry
+  (`getPointAtLength`), offset onto the path normal so it never covers a stage
+  marker. Auto-advances every 4.6s, pauses on hover/focus or while the NDI
+  popup is open, and has an Auto/Manual toggle. Its accent color (gradient,
+  markers, active tab) follows the online/walk-in flow toggle.
 - **Step control** — the rail is decorative (`aria-hidden`); the real control is
   a `role="tablist"` chip row that works with arrow keys, Home and End.
 - **Boarding pass** — tilts in 3D toward the pointer with a gloss that tracks

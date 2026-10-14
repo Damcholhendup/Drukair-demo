@@ -22,7 +22,7 @@ const inter = Inter({
 export const metadata: Metadata = {
   title: "Drukair — Passenger Onboarding",
   description:
-    "A Drukair concept site walking through the passenger onboarding process, from check-in to cabin seat.",
+    "A Drukair concept site demonstrating Bhutan NDI: a ticket VC issued at check-in, then a boarding pass VC issued at the gate.",
 };
 
 export default function RootLayout({

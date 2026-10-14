@@ -15,49 +15,30 @@ import NdiScanModal from "./ndi/NdiScanModal";
 import Reveal from "./Reveal";
 import { StepIcon } from "./StepIcons";
 
-/** The six stages a passenger passes through on the way to their seat. */
+/**
+ * The two real processes this demo actually performs — every other
+ * onboarding stage (baggage, security, immigration, cabin seat) was
+ * decorative placeholder copy unconnected to any NDI call, so it's gone
+ * rather than kept as dead weight.
+ */
 const STEPS = [
   {
     code: "01",
     title: "Check-in",
     blurb:
       "Prove who you are with your Bhutan NDI wallet to get your ticket as a verifiable credential. Scan the code, share the requested credential, and check-in completes.",
-    meta: ["Bhutan NDI", "T-90 min"],
+    meta: ["Ticket VC", "Bhutan NDI"],
   },
   {
     code: "02",
-    title: "Baggage drop",
-    blurb: "Placeholder copy for the baggage drop stage of the onboarding process.",
-    meta: ["Tagged", "T-80 min"],
-  },
-  {
-    code: "03",
-    title: "Security",
-    blurb: "Placeholder copy for the security screening stage of the process.",
-    meta: ["Screening", "T-60 min"],
-  },
-  {
-    code: "04",
-    title: "Immigration",
-    blurb: "Placeholder copy for the immigration and document check stage.",
-    meta: ["Documents", "T-45 min"],
-  },
-  {
-    code: "05",
     title: "Boarding gate",
     blurb:
       "Present your ticket VC once more to receive your boarding pass as a verifiable credential.",
-    meta: ["Gate 2", "T-25 min"],
-  },
-  {
-    code: "06",
-    title: "Cabin seat",
-    blurb: "Placeholder copy for taking your seat inside the aircraft cabin.",
-    meta: ["Onboard", "T-10 min"],
+    meta: ["Boarding Pass VC", "Bhutan NDI"],
   },
 ] as const;
 
-const BOARDING_STEP_INDEX = 4;
+const BOARDING_STEP_INDEX = 1;
 
 const RAIL =
   "M 46 182 C 190 62, 336 62, 476 142 C 616 222, 754 220, 890 118 C 968 60, 1064 52, 1158 82";
@@ -90,6 +71,40 @@ export default function OnboardingJourney() {
    *  setting, so the demo can show either. */
   const [flowType, setFlowType] = useState<"online" | "walkin">("online");
   const uiMode = flowUiMode();
+  const isWalkin = flowType === "walkin";
+  /**
+   * Every accent-colored element in this whole section (dial ring, icon wash,
+   * active tab, rail gradient, stage markers, dwell timer) reads off this one
+   * object — so switching flows shows up as a section-wide color shift, not
+   * just a toggle click. Walk-in reuses the theme's own `haze` blue rather
+   * than inventing a new color, and deliberately never touches the NDI
+   * popup's teal/green (lib/ndi/config.ts) — that separation stays intact.
+   *
+   * Every value here is a COMPLETE class name (opacity modifiers included) —
+   * Tailwind's build-time scanner only generates CSS for class names that
+   * appear as literal text in source, so concatenating a suffix onto these at
+   * the call site (e.g. `${accent.icon}/80`) would silently produce a
+   * class with no matching styles.
+   */
+  const accent = {
+    eyebrow: isWalkin ? "text-haze-500/80" : "text-saffron-600/80",
+    ring: isWalkin ? "border-haze-500/30" : "border-saffron-500/30",
+    wash: isWalkin ? "from-haze-500/12 to-haze-300/5" : "from-saffron-500/12 to-gold-400/5",
+    icon: isWalkin ? "text-haze-500" : "text-saffron-500",
+    timerGrad: isWalkin ? "from-haze-500 to-haze-300" : "from-saffron-500 to-gold-400",
+    tabActive: isWalkin
+      ? "border-haze-500/60 bg-haze-500/10 text-ink-900"
+      : "border-saffron-500/60 bg-saffron-500/10 text-ink-900",
+    pillBg: isWalkin ? "bg-haze-500/10" : "bg-saffron-500/10",
+    // Raw hex/rgba for the SVG rail, which sets stroke/fill via props, not classes.
+    railStops: isWalkin
+      ? (["#1f4460", "#5b8fb5", "#b0cde2"] as const)
+      : (["#d9541a", "#f26b1d", "#f5b841"] as const),
+    markerMain: isWalkin ? "#5b8fb5" : "#f26b1d",
+    markerText: isWalkin ? "#1f4460" : "#d9541a",
+    markerDoneRing: isWalkin ? "rgba(91,143,181,0.5)" : "rgba(242,107,29,0.5)",
+    markerDoneText: isWalkin ? "rgba(31,68,96,0.85)" : "rgba(217,84,26,0.85)",
+  };
 
   const progress = useSpring(0, {
     stiffness: reduce ? 400 : 46,
@@ -184,6 +199,9 @@ export default function OnboardingJourney() {
       : active === BOARDING_STEP_INDEX && flowType === "walkin"
         ? "Not used for walk-in passengers — their boarding pass was already issued at check-in."
         : step.blurb;
+  // Both remaining steps change with flowType, so this always re-animates —
+  // unlike when there were unrelated steps in between that shouldn't have.
+  const flowRegionKey = `${active}-${flowType}`;
 
   return (
     <section
@@ -205,7 +223,7 @@ export default function OnboardingJourney() {
                 The process
               </p>
               <h2 className="text-ink-900 mt-4 text-4xl font-semibold tracking-tight sm:text-5xl">
-                From the counter to the cabin
+                From check-in to the gate
               </h2>
             </div>
             <button
@@ -247,13 +265,21 @@ export default function OnboardingJourney() {
                   setTicket(null);
                   setNdiOpen(false);
                 }}
-                className={`rounded-full px-4 py-2 font-mono text-[11px] tracking-[0.16em] uppercase transition-colors ${
-                  flowType === key
-                    ? "bg-saffron-500/10 text-saffron-600"
-                    : "text-ink-400 hover:text-ink-900"
+                className={`relative rounded-full px-4 py-2 font-mono text-[11px] tracking-[0.16em] uppercase transition-colors ${
+                  flowType === key ? "text-saffron-600" : "text-ink-400 hover:text-ink-900"
                 }`}
               >
-                {label}
+                {/* A single shared element that slides between the two
+                    buttons on click — the toggle itself was easy to miss
+                    since the label text alone barely changes. */}
+                {flowType === key && (
+                  <motion.span
+                    layoutId="flow-toggle-pill"
+                    className={`${accent.pillBg} absolute inset-0 rounded-full`}
+                    transition={{ type: "spring", stiffness: 500, damping: 32 }}
+                  />
+                )}
+                <span className="relative">{label}</span>
               </button>
             ))}
           </div>
@@ -273,9 +299,21 @@ export default function OnboardingJourney() {
             >
               <defs>
                 <linearGradient id="rail-live" x1="0" y1="0" x2="1" y2="0">
-                  <stop offset="0%" stopColor="var(--color-saffron-600)" />
-                  <stop offset="60%" stopColor="var(--color-saffron-500)" />
-                  <stop offset="100%" stopColor="var(--color-gold-400)" />
+                  <stop
+                    offset="0%"
+                    stopColor={accent.railStops[0]}
+                    style={{ transition: "stop-color 0.5s ease" }}
+                  />
+                  <stop
+                    offset="60%"
+                    stopColor={accent.railStops[1]}
+                    style={{ transition: "stop-color 0.5s ease" }}
+                  />
+                  <stop
+                    offset="100%"
+                    stopColor={accent.railStops[2]}
+                    style={{ transition: "stop-color 0.5s ease" }}
+                  />
                 </linearGradient>
                 <filter id="rail-glow" x="-20%" y="-40%" width="140%" height="180%">
                   <feGaussianBlur stdDeviation="6" />
@@ -337,7 +375,8 @@ export default function OnboardingJourney() {
                     {isHere && (
                       <motion.circle
                         r="20"
-                        fill="var(--color-saffron-500)"
+                        fill={accent.markerMain}
+                        style={{ transition: "fill 0.5s ease" }}
                         animate={{ scale: [1, 2.1], opacity: [0.32, 0] }}
                         transition={{ duration: 2.4, repeat: Infinity, ease: "easeOut" }}
                       />
@@ -347,26 +386,21 @@ export default function OnboardingJourney() {
                       fill="#ffffff"
                       stroke={
                         isHere
-                          ? "var(--color-saffron-500)"
+                          ? accent.markerMain
                           : done
-                            ? "rgba(242,107,29,0.5)"
+                            ? accent.markerDoneRing
                             : "var(--color-haze-300)"
                       }
                       strokeWidth={isHere ? 2.5 : 1.5}
-                      style={{ transition: "r 400ms ease" }}
+                      style={{ transition: "r 400ms ease, stroke 0.5s ease" }}
                     />
                     <text
                       textAnchor="middle"
                       dominantBaseline="central"
                       fontSize="13"
                       fontFamily="var(--font-geist-mono), monospace"
-                      fill={
-                        isHere
-                          ? "var(--color-saffron-600)"
-                          : done
-                            ? "rgba(217,84,26,0.85)"
-                            : "var(--color-ink-400)"
-                      }
+                      fill={isHere ? accent.markerText : done ? accent.markerDoneText : "var(--color-ink-400)"}
+                      style={{ transition: "fill 0.5s ease" }}
                     >
                       {STEPS[i].code}
                     </text>
@@ -406,14 +440,14 @@ export default function OnboardingJourney() {
                 onClick={() => setActive(i)}
                 className={`group flex shrink-0 snap-start items-center gap-2.5 rounded-full border px-4 py-2.5 text-sm whitespace-nowrap transition-all duration-400 ${
                   i === active
-                    ? "border-saffron-500/60 bg-saffron-500/10 text-ink-900"
+                    ? accent.tabActive
                     : "border-haze-200 text-ink-500 hover:border-haze-400 hover:text-ink-900 bg-white"
                 }`}
               >
                 <span className="font-mono text-[10px] opacity-60">{s.code}</span>
                 <StepIcon
                   index={i}
-                  className={`h-4 w-4 transition-colors ${i === active ? "text-saffron-500" : ""}`}
+                  className={`h-4 w-4 transition-colors ${i === active ? accent.icon : ""}`}
                 />
                 {s.title}
               </button>
@@ -429,7 +463,7 @@ export default function OnboardingJourney() {
             <div className="absolute inset-x-0 top-0 h-[2px] overflow-hidden">
               <motion.div
                 key={`${active}-${playing}-${held}`}
-                className="from-saffron-500 to-gold-400 h-full bg-gradient-to-r"
+                className={`${accent.timerGrad} h-full bg-gradient-to-r`}
                 initial={{ width: "0%" }}
                 animate={{ width: playing && !held && !reduce ? "100%" : "0%" }}
                 transition={{ duration: DWELL_MS / 1000, ease: "linear" }}
@@ -454,82 +488,102 @@ export default function OnboardingJourney() {
                 {/* Rotating dial holding the step icon */}
                 <div className="relative h-28 w-28 shrink-0">
                   <motion.span
-                    className="border-saffron-500/30 absolute inset-0 rounded-full border border-dashed"
+                    className={`${accent.ring} absolute inset-0 rounded-full border border-dashed transition-colors duration-500`}
                     animate={reduce ? {} : { rotate: 360 }}
                     transition={{ duration: 26, repeat: Infinity, ease: "linear" }}
                   />
-                  <span className="from-saffron-500/12 to-gold-400/5 absolute inset-3 rounded-full bg-gradient-to-br" />
-                  <span className="text-saffron-500 absolute inset-0 grid place-items-center">
+                  <span className={`${accent.wash} absolute inset-3 rounded-full bg-gradient-to-br`} />
+                  <span
+                    className={`${accent.icon} absolute inset-0 grid place-items-center transition-colors duration-500`}
+                  >
                     <StepIcon index={active} className="h-11 w-11" />
                   </span>
                 </div>
 
                 <div>
-                  <p className="text-saffron-600/80 font-mono text-[11px] tracking-[0.32em] uppercase">
+                  <p
+                    className={`${accent.eyebrow} font-mono text-[11px] tracking-[0.32em] uppercase transition-colors duration-500`}
+                  >
                     Step {step.code} of {STEPS.length}
                   </p>
                   <h3 className="text-ink-900 mt-3 text-3xl font-semibold tracking-tight sm:text-4xl">
                     {step.title}
                   </h3>
-                  <p className="text-ink-500 mt-4 max-w-xl leading-relaxed">
-                    {blurb}
-                  </p>
-                  <div className="mt-6 flex flex-wrap gap-2">
-                    {step.meta.map((m) => (
-                      <span
-                        key={m}
-                        className="border-haze-200 text-ink-400 bg-haze-50 rounded-full border px-3 py-1.5 font-mono text-[10px] tracking-[0.16em] uppercase"
-                      >
-                        {m}
-                      </span>
-                    ))}
-                  </div>
-
-                  {/* Check-in is the live step: it opens a real Bhutan NDI
-                      proof request. Online + "continuous" mode has this
-                      single trigger also carry the flow through the
-                      boarding-pass stage; walk-in issues the boarding pass
-                      directly off this same step, in one proof. */}
-                  {active === 0 && (
-                    <div className="border-haze-200 mt-8 border-t pt-6">
-                      <p className="text-ink-400 mb-3 font-mono text-[10px] tracking-[0.2em] uppercase">
-                        Verify with Bhutan National Digital Identity
+                  {/* Re-animates specifically when the online/walk-in toggle
+                      changes what this step shows (steps 0 and boarding-gate
+                      only — see flowRegionKey) so switching flows reads as a
+                      distinct, noticeable change instead of a static swap. */}
+                  <AnimatePresence mode="wait">
+                    <motion.div
+                      key={flowRegionKey}
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: -8, transition: { duration: 0.14 } }}
+                      transition={{ duration: 0.32, ease: [0.22, 1, 0.36, 1] }}
+                    >
+                      <p className="text-ink-500 mt-4 max-w-xl leading-relaxed">
+                        {blurb}
                       </p>
-                      <NdiButton
-                        onClick={() => {
-                          setNdiKind(flowType === "walkin" ? "walkin" : "ticket");
-                          setNdiOpen(true);
-                        }}
-                      />
-                    </div>
-                  )}
+                      <div className="mt-6 flex flex-wrap gap-2">
+                        {step.meta.map((m) => (
+                          <span
+                            key={m}
+                            className="border-haze-200 text-ink-400 bg-haze-50 rounded-full border px-3 py-1.5 font-mono text-[10px] tracking-[0.16em] uppercase"
+                          >
+                            {m}
+                          </span>
+                        ))}
+                      </div>
 
-                  {/* Boarding gate only carries its own trigger for the
-                      online flow in "separate" mode — "continuous" mode
-                      already reached this stage inside the check-in modal,
-                      and walk-in never needs it at all, since its boarding
-                      pass was issued at step 0. Disabled until a ticket VC
-                      has actually been issued this session. */}
-                  {active === BOARDING_STEP_INDEX && flowType === "online" && uiMode === "separate" && (
-                    <div className="border-haze-200 mt-8 border-t pt-6">
-                      <p className="text-ink-400 mb-3 font-mono text-[10px] tracking-[0.2em] uppercase">
-                        Verify with Bhutan National Digital Identity
-                      </p>
-                      {ticket ? (
-                        <NdiButton
-                          label="Get boarding pass"
-                          onClick={() => {
-                            setNdiKind("boarding");
-                            setNdiOpen(true);
-                          }}
-                        />
-                      ) : (
-                        <p className="text-ink-400 text-sm">
-                          Complete check-in first to unlock your boarding pass.
-                        </p>
+                      {/* Check-in is the live step: it opens a real Bhutan NDI
+                          proof request. Online + "continuous" mode has this
+                          single trigger also carry the flow through the
+                          boarding-pass stage; walk-in issues the boarding pass
+                          directly off this same step, in one proof. */}
+                      {active === 0 && (
+                        <div className="border-haze-200 mt-8 border-t pt-6">
+                          <p className="text-ink-400 mb-3 font-mono text-[10px] tracking-[0.2em] uppercase">
+                            Verify with Bhutan National Digital Identity
+                          </p>
+                          <NdiButton
+                            onClick={() => {
+                              setNdiKind(flowType === "walkin" ? "walkin" : "ticket");
+                              setNdiOpen(true);
+                            }}
+                          />
+                        </div>
                       )}
-                    </div>
-                  )}
+
+                      {/* Boarding gate only carries its own trigger for the
+                          online flow in "separate" mode — "continuous" mode
+                          already reached this stage inside the check-in modal,
+                          and walk-in never needs it at all, since its boarding
+                          pass was issued at step 0. Disabled until a ticket VC
+                          has actually been issued this session. */}
+                      {active === BOARDING_STEP_INDEX &&
+                        flowType === "online" &&
+                        uiMode === "separate" && (
+                          <div className="border-haze-200 mt-8 border-t pt-6">
+                            <p className="text-ink-400 mb-3 font-mono text-[10px] tracking-[0.2em] uppercase">
+                              Verify with Bhutan National Digital Identity
+                            </p>
+                            {ticket ? (
+                              <NdiButton
+                                label="Get boarding pass"
+                                onClick={() => {
+                                  setNdiKind("boarding");
+                                  setNdiOpen(true);
+                                }}
+                              />
+                            ) : (
+                              <p className="text-ink-400 text-sm">
+                                Complete check-in first to unlock your boarding pass.
+                              </p>
+                            )}
+                          </div>
+                        )}
+                    </motion.div>
+                  </AnimatePresence>
                 </div>
               </motion.div>
             </AnimatePresence>
